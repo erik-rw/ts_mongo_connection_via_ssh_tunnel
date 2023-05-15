@@ -1,5 +1,5 @@
-const { MongoClient } = require("mongodb");
-import { SSHConnection } from 'node-ssh-forward'
+const {MongoClient} = require("mongodb");
+import {SSHConnection} from 'node-ssh-forward'
 import * as fs from 'fs';
 import * as dotenv from 'dotenv';
 
@@ -20,55 +20,118 @@ if (!jumpHostPrivateKeyPath) throw new Error("JUMP_HOST_PRIVATE_KEY_PATH not set
 const mongoDbHost = process.env.MONGODB_HOST;
 if (!mongoDbHost) throw new Error("MONGODB_HOST not set");
 
+const mongoDbPort = process.env.MONGODB_PORT ? Number.parseInt(process.env.MONGODB_PORT) : 0;
+if (!mongoDbPort) throw new Error("MONGODB_PORT not set");
+
 const user = process.env.MONGODB_USER;
 if (!user) throw new Error("MONGODB_USER not set");
 
 const password = process.env.MONGODB_PASSWORD;
 if (!password) throw new Error("MONGODB_PASSWORD not set");
 
+const databaseName = process.env.MONGODB_DATABASE_NAME;
+if (!databaseName) throw new Error("MONGODB_DATABASE_NAME not set");
+
+const collectionName = process.env.MONGODB_COLLECTION_NAME;
+if (!collectionName) throw new Error("MONGODB_COLLECTION_NAME not set");
+
+const collectionLimit = process.env.MONGODB_COLLECTION_LIMIT ? Number.parseInt(process.env.MONGODB_COLLECTION_LIMIT) : 0
+if (!collectionLimit) throw new Error("MONGODB_COLLECTION_LIMIT not set");
+
 const tlsCAFile = process.env.MONGODB_TLS_CA_FILE;
 if (!tlsCAFile) throw new Error("MONGODB_TLS_CA_FILE not set");
 
-console.table({
+type Config = {
+    jumpHostIp: string;
+    jumpHostPort: string;
+    jumpHostUser: string;
+    jumpHostPrivateKeyPath: string;
+    mongoDbHost: string;
+    mongoDbPort: number;
+    user: string;
+    password: string;
+    databaseName: string;
+    collectionName: string;
+    tlsCAFile: string;
+    localPort: number;
+}
+const config: Config = {
     jumpHostIp,
     jumpHostPort,
     jumpHostUser,
     jumpHostPrivateKeyPath,
     mongoDbHost,
+    mongoDbPort,
     user,
     password,
-    tlsCAFile
-});
+    databaseName,
+    collectionName,
+    tlsCAFile,
+    localPort: 27017 + Math.floor(Math.random() * 10000),
+};
 
-export default async function run() {
-    const privateKey = fs.readFileSync(jumpHostPrivateKeyPath!);
-    const sshConnection = new SSHConnection({
-        endHost: jumpHostIp!,
-        endPort: Number.parseInt(jumpHostPort!),
-        username: jumpHostUser!,
-        privateKey
-    });
-    await sshConnection.forward({
-        fromPort: 27017,
-        toPort: 27017,
-        toHost: mongoDbHost!
-    });
+console.error('config', config);
 
-    const uri = `mongodb://${user}:${password}@localhost:27017/?authMechanism=DEFAULT&tls=true&tlsCAFile=${encodeURIComponent(tlsCAFile!)}&retryWrites=false&authSource=doctari`;
-    const client = new MongoClient(uri, {
-        tlsAllowInvalidHostnames: true,
-        directConnection: true,
-    });
-
+async function createSshTunnel(cfg: Config) {
     try {
-        await client.connect();
-        console.log(await client.db().admin().listDatabases());
-        const result = await client.db("DB").collection("COLLECTION").find(undefined, { limit: 3 }).toArray();
-        console.log(result);
+        const privateKey = fs.readFileSync(cfg.jumpHostPrivateKeyPath);
+        const sshConnection = new SSHConnection({
+            endHost: cfg.jumpHostIp,
+            endPort: Number.parseInt(cfg.jumpHostPort),
+            username: cfg.jumpHostUser,
+            privateKey
+        });
+        await sshConnection.forward({
+            fromPort: cfg.localPort,
+            toPort: cfg.mongoDbPort,
+            toHost: cfg.mongoDbHost
+        });
+        return sshConnection;
 
-    } finally {
-        await client.close();
-        await sshConnection.shutdown();
+    } catch (error) {
+        console.error(`Failed to create SSH tunnel: ${error}`);
+        process.exit(1);
     }
 }
-run().catch(console.dir);
+
+async function connectMongoDb(cfg: Config) {
+    try {
+        const uri = `mongodb://${cfg.user}:${cfg.password}@localhost:${cfg.localPort}/?authMechanism=DEFAULT&tls=true&tlsCAFile=${encodeURIComponent(cfg.tlsCAFile)}&retryWrites=false&authSource=${cfg.databaseName}`;
+        const client = new MongoClient(uri, {
+            tlsAllowInvalidHostnames: true,
+            directConnection: true,
+        });
+        await client.connect();
+        return client;
+    } catch (error) {
+        console.error(`Failed to connect to MongoDB: ${error}`);
+        process.exit(1);
+    }
+}
+
+async function run(cfg: Config) {
+    const sshConnection = await createSshTunnel(cfg);
+    const client = await connectMongoDb(cfg);
+
+    try {
+        const databaseNames = (await client.db().admin().listDatabases()).databases.map((db: { name: string }) => db.name);
+        console.error('databaseNames', databaseNames);
+        if (databaseNames.indexOf(cfg.databaseName) === -1) {
+            console.error(`Database ${databaseName} not found`);
+            process.exit(1);
+        }
+        const options = collectionLimit >= 0 ?
+            { limit: collectionLimit }
+            : undefined;
+        const cursor = await client.db(cfg.databaseName).collection(cfg.collectionName).find(undefined, options);
+        while (cursor && await cursor.hasNext()) {
+            console.log(await cursor.next());
+        }
+
+    } finally {
+        if (client) await client.close();
+        if (sshConnection) await sshConnection.shutdown();
+    }
+}
+
+run(config).catch(console.dir);
