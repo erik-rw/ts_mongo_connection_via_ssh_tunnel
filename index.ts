@@ -1,3 +1,5 @@
+import {FindCursor, WithId, Document} from "mongodb";
+
 const {MongoClient} = require("mongodb");
 import {SSHConnection} from 'node-ssh-forward'
 import * as fs from 'fs';
@@ -54,6 +56,7 @@ type Config = {
     collectionName: string;
     tlsCAFile: string;
     localPort: number;
+    outputFormat: 'json' | 'jl';
 }
 const config: Config = {
     jumpHostIp,
@@ -67,6 +70,7 @@ const config: Config = {
     databaseName,
     collectionName,
     tlsCAFile,
+    outputFormat: 'json',
     localPort: 27017 + Math.floor(Math.random() * 10000),
 };
 
@@ -109,7 +113,28 @@ async function connectMongoDb(cfg: Config) {
     }
 }
 
+type Writer = (cursor: FindCursor<WithId<Document>>) => Promise<void>;
+
+async function writeJL(cursor: FindCursor<WithId<Document>>) {
+    while (cursor && await cursor.hasNext()) {
+        console.log(JSON.stringify(await cursor.next()));
+    }
+}
+
+async function writeJson(cursor: FindCursor<WithId<Document>>) {
+    let line = 0;
+    console.log('[');
+    while (cursor && await cursor.hasNext()) {
+        if (line++ > 0) {
+            console.log(',')
+        }
+        console.log(JSON.stringify(await cursor.next()));
+    }
+    console.log(']');
+}
+
 async function run(cfg: Config) {
+    const writer = cfg.outputFormat === 'jl' ? writeJL : writeJson;
     const sshConnection = await createSshTunnel(cfg);
     const client = await connectMongoDb(cfg);
 
@@ -121,12 +146,10 @@ async function run(cfg: Config) {
             process.exit(1);
         }
         const options = collectionLimit >= 0 ?
-            { limit: collectionLimit }
+            {limit: collectionLimit}
             : undefined;
         const cursor = await client.db(cfg.databaseName).collection(cfg.collectionName).find(undefined, options);
-        while (cursor && await cursor.hasNext()) {
-            console.log(await cursor.next());
-        }
+        await writer(cursor);
 
     } finally {
         if (client) await client.close();
